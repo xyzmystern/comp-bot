@@ -54,6 +54,7 @@ import prremoveCmd from "./commands/prremove";
 import leaderboardCmd from "./commands/leaderboard";
 import profileCmd from "./commands/profile";
 import lookupCmd from "./commands/lookup";
+import prhistoryCmd from "./commands/prhistory";
 
 const BUILT_IN_COMMANDS: BotCommand[] = [
   helpCmd,
@@ -82,6 +83,7 @@ const BUILT_IN_COMMANDS: BotCommand[] = [
   leaderboardCmd,
   profileCmd,
   lookupCmd,
+  prhistoryCmd,
 ];
 
 async function getPrefix(guildId: string): Promise<string> {

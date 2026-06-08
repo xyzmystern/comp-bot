@@ -1,4 +1,11 @@
-import { Client, Collection, Events } from "discord.js";
+import {
+  Client,
+  Collection,
+  Events,
+  REST,
+  Routes,
+  ChatInputCommandInteraction,
+} from "discord.js";
 import type { BotCommand } from "./types";
 import { logger } from "../lib/logger";
 import { db } from "@workspace/db";
@@ -63,11 +70,30 @@ async function getPrefix(guildId: string): Promise<string> {
   }
 }
 
+async function registerSlashCommands(client: Client, commands: Collection<string, BotCommand>) {
+  const token = process.env.DISCORD_BOT_TOKEN;
+  if (!token || !client.application) return;
+
+  const slashBodies = [...new Set(commands.values())]
+    .filter((cmd) => cmd.slashData)
+    .map((cmd) => cmd.slashData!.toJSON());
+
+  try {
+    const rest = new REST().setToken(token);
+    await rest.put(Routes.applicationCommands(client.application.id), {
+      body: slashBodies,
+    });
+    logger.info({ count: slashBodies.length }, "Registered global slash commands");
+  } catch (err) {
+    logger.error({ err }, "Failed to register slash commands");
+  }
+}
+
 export async function registerEvents(
   client: Client,
   commands: Collection<string, BotCommand>,
 ): Promise<void> {
-  // Register built-in commands
+  // Register built-in commands into the collection
   for (const cmd of BUILT_IN_COMMANDS) {
     commands.set(cmd.name, cmd);
     if (cmd.aliases) {
@@ -77,6 +103,38 @@ export async function registerEvents(
     }
   }
 
+  // Register slash commands once the client is ready
+  client.once(Events.ClientReady, async (c) => {
+    await registerSlashCommands(c, commands);
+  });
+
+  // Handle slash command interactions
+  client.on(Events.InteractionCreate, async (interaction) => {
+    if (!interaction.isChatInputCommand()) return;
+
+    const cmd = commands.get(interaction.commandName);
+    if (!cmd?.executeSlash) {
+      await interaction.reply({
+        content: "❌ This command is not available as a slash command.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    try {
+      await cmd.executeSlash(interaction as ChatInputCommandInteraction);
+    } catch (err) {
+      logger.error({ err, command: interaction.commandName }, "Slash command error");
+      const payload = { content: "❌ An error occurred while running that command.", ephemeral: true };
+      if (interaction.replied || interaction.deferred) {
+        await interaction.followUp(payload).catch(() => null);
+      } else {
+        await interaction.reply(payload).catch(() => null);
+      }
+    }
+  });
+
+  // Handle prefix-based message commands
   client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot || !message.guild) return;
 
@@ -92,21 +150,15 @@ export async function registerEvents(
     const command = commands.get(commandName);
     if (command) {
       try {
-        await command.execute({
-          client,
-          message,
-          args,
-          commands,
-          prefix,
-        });
+        await command.execute({ client, message, args, commands, prefix });
       } catch (err) {
-        logger.error({ err, commandName }, "Error executing command");
+        logger.error({ err, commandName }, "Error executing prefix command");
         await message.reply("❌ An error occurred while running that command.");
       }
       return;
     }
 
-    // Check custom commands
+    // Fall through to custom commands
     try {
       const [custom] = await db
         .select()
@@ -127,6 +179,7 @@ export async function registerEvents(
     }
   });
 
+  // Welcome new members
   client.on(Events.GuildMemberAdd, async (member) => {
     try {
       const [settings] = await db
@@ -136,10 +189,8 @@ export async function registerEvents(
         .limit(1);
 
       if (settings?.welcomeChannelId) {
-        const channel = member.guild.channels.cache.get(
-          settings.welcomeChannelId,
-        );
-        if (channel?.isTextBased()) {
+        const channel = member.guild.channels.cache.get(settings.welcomeChannelId);
+        if (channel?.isTextBased() && "send" in channel) {
           const msg =
             settings.welcomeMessage
               ?.replace("{user}", `<@${member.id}>`)

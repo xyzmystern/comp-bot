@@ -77,3 +77,5 @@ export const remindersTable = pgTable("reminders", {
 export const insertReminderSchema = createInsertSchema(remindersTable).omit({ id: true, createdAt: true });
 export type InsertReminder = z.infer<typeof insertReminderSchema>;
 export type Reminder = typeof remindersTable.$inferSelect;
+
+export * from "./competitive";

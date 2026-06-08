@@ -5,14 +5,29 @@ import {
   REST,
   Routes,
   ChatInputCommandInteraction,
+  EmbedBuilder,
 } from "discord.js";
 import type { BotCommand } from "./types";
 import { logger } from "../lib/logger";
 import { db } from "@workspace/db";
-import { guildSettingsTable, customCommandsTable } from "@workspace/db";
+import {
+  guildSettingsTable,
+  customCommandsTable,
+  competitivePlayersTable,
+} from "@workspace/db";
 import { eq, and } from "drizzle-orm";
 
-// Import all built-in commands
+// Modal field IDs
+import {
+  REGISTER_MODAL_ID,
+  FIELD_IGN,
+  FIELD_COUNTRY,
+  FIELD_REGION,
+  FIELD_PLATFORM,
+  FIELD_GAMEID,
+} from "./commands/register";
+
+// Built-in commands
 import helpCmd from "./commands/help";
 import banCmd from "./commands/ban";
 import kickCmd from "./commands/kick";
@@ -33,6 +48,10 @@ import prefixCmd from "./commands/prefix";
 import welcomeCmd from "./commands/welcome";
 import muteCmd from "./commands/mute";
 import unmuteCmd from "./commands/unmute";
+import registerCmd from "./commands/register";
+import praddCmd from "./commands/pradd";
+import prremoveCmd from "./commands/prremove";
+import leaderboardCmd from "./commands/leaderboard";
 
 const BUILT_IN_COMMANDS: BotCommand[] = [
   helpCmd,
@@ -55,6 +74,10 @@ const BUILT_IN_COMMANDS: BotCommand[] = [
   welcomeCmd,
   muteCmd,
   unmuteCmd,
+  registerCmd,
+  praddCmd,
+  prremoveCmd,
+  leaderboardCmd,
 ];
 
 async function getPrefix(guildId: string): Promise<string> {
@@ -70,12 +93,20 @@ async function getPrefix(guildId: string): Promise<string> {
   }
 }
 
-async function registerSlashCommands(client: Client, commands: Collection<string, BotCommand>) {
+async function registerSlashCommands(
+  client: Client,
+  commands: Collection<string, BotCommand>,
+) {
   const token = process.env.DISCORD_BOT_TOKEN;
   if (!token || !client.application) return;
 
-  const slashBodies = [...new Set(commands.values())]
-    .filter((cmd) => cmd.slashData)
+  const seen = new Set<string>();
+  const slashBodies = [...commands.values()]
+    .filter((cmd) => {
+      if (!cmd.slashData || seen.has(cmd.name)) return false;
+      seen.add(cmd.name);
+      return true;
+    })
     .map((cmd) => cmd.slashData!.toJSON());
 
   try {
@@ -93,7 +124,6 @@ export async function registerEvents(
   client: Client,
   commands: Collection<string, BotCommand>,
 ): Promise<void> {
-  // Register built-in commands into the collection
   for (const cmd of BUILT_IN_COMMANDS) {
     commands.set(cmd.name, cmd);
     if (cmd.aliases) {
@@ -103,50 +133,113 @@ export async function registerEvents(
     }
   }
 
-  // Register slash commands once the client is ready
   client.once(Events.ClientReady, async (c) => {
     await registerSlashCommands(c, commands);
   });
 
-  // Handle slash command interactions
+  // Slash command + modal interactions
   client.on(Events.InteractionCreate, async (interaction) => {
-    if (!interaction.isChatInputCommand()) return;
-
-    const cmd = commands.get(interaction.commandName);
-    if (!cmd?.executeSlash) {
-      await interaction.reply({
-        content: "❌ This command is not available as a slash command.",
-        ephemeral: true,
-      });
+    // Slash commands
+    if (interaction.isChatInputCommand()) {
+      const cmd = commands.get(interaction.commandName);
+      if (!cmd?.executeSlash) {
+        await interaction.reply({
+          content: "❌ This command is not available as a slash command.",
+          ephemeral: true,
+        });
+        return;
+      }
+      try {
+        await cmd.executeSlash(interaction as ChatInputCommandInteraction);
+      } catch (err) {
+        logger.error({ err, command: interaction.commandName }, "Slash command error");
+        const payload = { content: "❌ An error occurred.", ephemeral: true };
+        if (interaction.replied || interaction.deferred) {
+          await interaction.followUp(payload).catch(() => null);
+        } else {
+          await interaction.reply(payload).catch(() => null);
+        }
+      }
       return;
     }
 
-    try {
-      await cmd.executeSlash(interaction as ChatInputCommandInteraction);
-    } catch (err) {
-      logger.error({ err, command: interaction.commandName }, "Slash command error");
-      const payload = { content: "❌ An error occurred while running that command.", ephemeral: true };
-      if (interaction.replied || interaction.deferred) {
-        await interaction.followUp(payload).catch(() => null);
-      } else {
-        await interaction.reply(payload).catch(() => null);
+    // Modal submissions
+    if (interaction.isModalSubmit()) {
+      if (interaction.customId === REGISTER_MODAL_ID) {
+        const ign = interaction.fields.getTextInputValue(FIELD_IGN).trim();
+        const country = interaction.fields.getTextInputValue(FIELD_COUNTRY).trim();
+        const region = interaction.fields.getTextInputValue(FIELD_REGION).trim().toUpperCase();
+        const platform = interaction.fields.getTextInputValue(FIELD_PLATFORM).trim();
+        const gameId = interaction.fields.getTextInputValue(FIELD_GAMEID).trim();
+
+        try {
+          const [existing] = await db
+            .select()
+            .from(competitivePlayersTable)
+            .where(
+              and(
+                eq(competitivePlayersTable.guildId, interaction.guildId!),
+                eq(competitivePlayersTable.userId, interaction.user.id),
+              ),
+            )
+            .limit(1);
+
+          if (existing) {
+            await db
+              .update(competitivePlayersTable)
+              .set({ ign, country, region, platform, gameId, updatedAt: new Date() })
+              .where(eq(competitivePlayersTable.id, existing.id));
+          } else {
+            await db.insert(competitivePlayersTable).values({
+              guildId: interaction.guildId!,
+              userId: interaction.user.id,
+              ign,
+              country,
+              region,
+              platform,
+              gameId,
+              pr: 0,
+            });
+          }
+
+          const embed = new EmbedBuilder()
+            .setColor(0x00cc99)
+            .setTitle("✅ Registration Complete")
+            .setThumbnail(interaction.user.displayAvatarURL())
+            .addFields(
+              { name: "In-Game Name", value: ign, inline: true },
+              { name: "Country", value: country, inline: true },
+              { name: "Region", value: region, inline: true },
+              { name: "Platform", value: platform, inline: true },
+              { name: "Game ID", value: gameId, inline: true },
+            )
+            .setFooter({ text: `Registered for ${interaction.guild?.name ?? "BuildNow GG Scrims"}` })
+            .setTimestamp();
+
+          await interaction.reply({ embeds: [embed], ephemeral: false });
+        } catch (err) {
+          logger.error({ err }, "Error saving competitive registration");
+          await interaction.reply({
+            content: "❌ Failed to save your registration. Please try again.",
+            ephemeral: true,
+          });
+        }
+        return;
       }
     }
   });
 
-  // Handle prefix-based message commands
+  // Prefix message commands
   client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot || !message.guild) return;
 
     const prefix = await getPrefix(message.guild.id);
-
     if (!message.content.startsWith(prefix)) return;
 
     const args = message.content.slice(prefix.length).trim().split(/\s+/);
     const commandName = args.shift()?.toLowerCase();
     if (!commandName) return;
 
-    // Check built-in commands first
     const command = commands.get(commandName);
     if (command) {
       try {
@@ -158,7 +251,7 @@ export async function registerEvents(
       return;
     }
 
-    // Fall through to custom commands
+    // Custom commands fallback
     try {
       const [custom] = await db
         .select()
